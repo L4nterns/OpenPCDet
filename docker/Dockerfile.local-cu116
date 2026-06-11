@@ -1,0 +1,94 @@
+ARG BASE_IMAGE=nvidia/cuda:11.6.2-devel-ubuntu20.04
+FROM ${BASE_IMAGE}
+
+ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+ARG PIP_TRUSTED_HOST=mirrors.aliyun.com
+ARG PYTORCH_WHEEL_BASE=https://mirrors.aliyun.com/pytorch-wheels/cu116
+ARG PYG_WHEEL_URL=https://data.pyg.org/whl/torch-1.13.1+cu116.html
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TORCH_CUDA_ARCH_LIST="6.0;6.1;7.0;7.5;8.0;8.6+PTX"
+ENV CUDA_HOME=/usr/local/cuda
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+# 限制 PyTorch 编译算子时的最大并行任务数，防止大服务器多线程编译导致内存耗尽(OOM)
+ENV MAX_JOBS=4
+
+# 1. 更换 APT 源
+RUN sed -i "s@http://archive.ubuntu.com/ubuntu/@https://${APT_MIRROR}/ubuntu/@g; \
+    s@http://security.ubuntu.com/ubuntu/@https://${APT_MIRROR}/ubuntu/@g" /etc/apt/sources.list
+
+# 2. 一次性安装所有编译与运行期依赖（使用 APT 缓存挂载）
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    git \
+    curl \
+    python3-dev \
+    python3-pip \
+    python3-setuptools \
+    python3-wheel \
+    python3-distutils \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    libgl1 \
+    libgomp1
+
+# 3. 配置系统 pip（使用 Pip 缓存挂载）
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip config set global.index-url "${PIP_INDEX_URL}" \
+    && python3 -m pip config set global.trusted-host "${PIP_TRUSTED_HOST}" \
+    && python3 -m pip install --upgrade pip setuptools wheel
+
+# 4. 安装 PyTorch 组件
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install \
+    "${PYTORCH_WHEEL_BASE}/torch-1.13.1%2Bcu116-cp38-cp38-linux_x86_64.whl" \
+    "${PYTORCH_WHEEL_BASE}/torchvision-0.14.1%2Bcu116-cp38-cp38-linux_x86_64.whl" \
+    "${PYTORCH_WHEEL_BASE}/torchaudio-0.13.1%2Bcu116-cp38-cp38-linux_x86_64.whl"
+
+# 5. 安装常规第三方依赖
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install \
+    numpy==1.23.0 \
+    llvmlite \
+    numba \
+    tensorboardX \
+    easydict \
+    pyyaml \
+    scikit-image \
+    tqdm \
+    SharedArray \
+    opencv-python \
+    kornia \
+    pyquaternion \
+    open3d
+
+# 6. 独立安装重型第三方算子库
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install spconv-cu116
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install torch-scatter==2.1.1 -f "${PYG_WHEEL_URL}"
+
+# ----------------------------------------------------------------------------------
+# 精细化缓存分离策略
+# ----------------------------------------------------------------------------------
+WORKDIR /workspace/OpenPCDet
+
+# 步骤 A：先只复制编译 CUDA 算子核心所需的文件
+COPY setup.py /workspace/OpenPCDet/
+COPY pcdet /workspace/OpenPCDet/pcdet
+
+# 步骤 B：编译 OpenPCDet 的 CUDA 算子并安装
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 setup.py develop
+
+# 步骤 C：最后复制剩下的所有文件（包含 tools/, cfgs/ 等经常修改的内容）
+COPY . /workspace/OpenPCDet
+
+CMD ["/bin/bash"]

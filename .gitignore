@@ -3,8 +3,13 @@
 **egg-info**
 **dist**
 data/
+labelCloud/
+infer/
+checkpoints/
 *.pyc
 venv/
+.venv/
+.uv-cache/
 *.idea/
 *.so
 *.yaml
@@ -15,3 +20,5 @@ venv/
 *.bin
 output
 version.py
+.history/
+.env

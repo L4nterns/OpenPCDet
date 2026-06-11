@@ -1,0 +1,284 @@
+name: openpcdet-labelcloud
+
+x-openpcdet: &openpcdet
+  image: openpcdet-labelcloud:cu116
+  build:
+    context: .
+    dockerfile: docker/Dockerfile.local-cu116
+    args:
+      BASE_IMAGE: ${BASE_IMAGE:-nvidia/cuda:11.6.2-devel-ubuntu20.04}
+      APT_MIRROR: ${APT_MIRROR:-mirrors.tuna.tsinghua.edu.cn}
+      PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple}
+      PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-mirrors.aliyun.com}
+      PYTORCH_WHEEL_BASE: ${PYTORCH_WHEEL_BASE:-https://mirrors.aliyun.com/pytorch-wheels/cu116}
+      PYG_WHEEL_URL: ${PYG_WHEEL_URL:-https://data.pyg.org/whl/torch-1.13.1+cu116.html}
+  working_dir: /workspace/OpenPCDet
+  ipc: host
+  gpus: all
+  volumes:
+    - ${LABELCLOUD_DIR:-./labelCloud}:/workspace/labelCloud:ro
+    - ${INFER_DIR:-./infer}:/workspace/infer:ro
+    - ${CHECKPOINTS_DIR:-./checkpoints}:/workspace/checkpoints:ro
+    - ${DATA_DIR:-./data}:/workspace/OpenPCDet/data
+    - ${OUTPUT_DIR:-./output}:/workspace/OpenPCDet/output
+  environment:
+    EXTRA_TAG: ${EXTRA_TAG:-}
+    CFG_FILE: ${CFG_FILE:-}
+    CKPT: ${CKPT:-}
+    PRETRAINED_MODEL: ${PRETRAINED_MODEL:-}
+    PRED_OUT_DIR: ${PRED_OUT_DIR:-}
+    AUG_MODE: ${AUG_MODE:-full}
+
+services:
+  pipeline:
+    <<: *openpcdet
+    command:
+      - python3
+      - tools/train_labelcloud_pipeline.py
+      - --class-file
+      - /workspace/labelCloud/_classes.json
+      - --pointcloud-dir
+      - /workspace/labelCloud/pointClouds
+      - --label-dir
+      - /workspace/labelCloud/labels
+      - --out-dir
+      - ${OUT_DIR:-data/custom}
+      - --train-ratio
+      - ${TRAIN_RATIO:-0.8}
+      - --val-ratio
+      - ${VAL_RATIO:-0.2}
+      - --seed
+      - ${SPLIT_SEED:-42}
+      - --model
+      - ${MODEL:-pv_rcnn}
+      - --batch-size
+      - ${BATCH_SIZE:-auto}
+      - --workers
+      - ${WORKERS:-4}
+      - --num-gpus
+      - ${NUM_GPUS:-auto}
+      - --master-port
+      - ${MASTER_PORT:-18888}
+      - --epochs
+      - ${EPOCHS:-80}
+      - --aug-mode
+      - ${AUG_MODE:-full}
+      - --extra-tag
+      - ${EXTRA_TAG:-}
+      - --cfg-file
+      - ${CFG_FILE:-}
+      - --ckpt
+      - ${CKPT:-}
+      - --pretrained-model
+      - ${PRETRAINED_MODEL:-}
+      - --gt-database-target-elements
+      - ${GT_DATABASE_TARGET_ELEMENTS:-4000000}
+      - --gt-database-min-chunk-size
+      - ${GT_DATABASE_MIN_CHUNK_SIZE:-50000}
+      - --gt-database-max-chunk-size
+      - ${GT_DATABASE_MAX_CHUNK_SIZE:-500000}
+      - --gt-database-max-points
+      - ${GT_DATABASE_MAX_POINTS:-0}
+      - --sample-points
+      - ${SAMPLE_POINTS:--1}
+      - --dsvt-iou-head
+      - ${DSVT_IOU_HEAD:-true}
+      - --dsvt-iou-reg-loss
+      - ${DSVT_IOU_REG_LOSS:-true}
+      - --dsvt-use-iou-to-rectify-score
+      - ${DSVT_USE_IOU_TO_RECTIFY_SCORE:-true}
+
+  convert:
+    <<: *openpcdet
+    command:
+      - python3
+      - tools/convert_labelcloud_to_custom.py
+      - --class-file
+      - /workspace/labelCloud/_classes.json
+      - --pointcloud-dir
+      - /workspace/labelCloud/pointClouds
+      - --label-dir
+      - /workspace/labelCloud/labels
+      - --out_dir
+      - ${OUT_DIR:-data/custom}
+      - --train-ratio
+      - ${TRAIN_RATIO:-0.8}
+      - --val-ratio
+      - ${VAL_RATIO:-0.2}
+      - --seed
+      - ${SPLIT_SEED:-42}
+      - --model
+      - ${MODEL:-pv_rcnn}
+      - --sample-points
+      - ${SAMPLE_POINTS:--1}
+      - --dsvt-iou-head
+      - ${DSVT_IOU_HEAD:-true}
+      - --dsvt-iou-reg-loss
+      - ${DSVT_IOU_REG_LOSS:-true}
+      - --dsvt-use-iou-to-rectify-score
+      - ${DSVT_USE_IOU_TO_RECTIFY_SCORE:-true}
+
+  reconvert:
+    <<: *openpcdet
+    command:
+      - python3
+      - tools/convert_labelcloud_to_custom.py
+      - --class-file
+      - /workspace/labelCloud/_classes.json
+      - --pointcloud-dir
+      - /workspace/labelCloud/pointClouds
+      - --label-dir
+      - /workspace/labelCloud/labels
+      - --out_dir
+      - ${OUT_DIR:-data/custom}
+      - --train-ratio
+      - ${TRAIN_RATIO:-0.8}
+      - --val-ratio
+      - ${VAL_RATIO:-0.2}
+      - --seed
+      - ${SPLIT_SEED:-42}
+      - --model
+      - ${MODEL:-pv_rcnn}
+      - --sample-points
+      - ${SAMPLE_POINTS:--1}
+      - --dsvt-iou-head
+      - ${DSVT_IOU_HEAD:-true}
+      - --dsvt-iou-reg-loss
+      - ${DSVT_IOU_REG_LOSS:-true}
+      - --dsvt-use-iou-to-rectify-score
+      - ${DSVT_USE_IOU_TO_RECTIFY_SCORE:-true}
+      - --overwrite
+
+  prepare:
+    <<: *openpcdet
+    command:
+      - python3
+      - tools/train_labelcloud_pipeline.py
+      - --skip-convert
+      - --skip-train
+      - --out-dir
+      - ${OUT_DIR:-data/custom}
+      - --model
+      - ${MODEL:-pv_rcnn}
+      - --workers
+      - ${WORKERS:-4}
+      - --gt-database-target-elements
+      - ${GT_DATABASE_TARGET_ELEMENTS:-4000000}
+      - --gt-database-min-chunk-size
+      - ${GT_DATABASE_MIN_CHUNK_SIZE:-50000}
+      - --gt-database-max-chunk-size
+      - ${GT_DATABASE_MAX_CHUNK_SIZE:-500000}
+      - --gt-database-max-points
+      - ${GT_DATABASE_MAX_POINTS:-0}
+
+  reprepare:
+    <<: *openpcdet
+    command:
+      - python3
+      - tools/train_labelcloud_pipeline.py
+      - --skip-convert
+      - --skip-train
+      - --out-dir
+      - ${OUT_DIR:-data/custom}
+      - --model
+      - ${MODEL:-pv_rcnn}
+      - --workers
+      - ${WORKERS:-4}
+      - --gt-database-target-elements
+      - ${GT_DATABASE_TARGET_ELEMENTS:-4000000}
+      - --gt-database-min-chunk-size
+      - ${GT_DATABASE_MIN_CHUNK_SIZE:-50000}
+      - --gt-database-max-chunk-size
+      - ${GT_DATABASE_MAX_CHUNK_SIZE:-500000}
+      - --gt-database-max-points
+      - ${GT_DATABASE_MAX_POINTS:-0}
+      - --rebuild-gt-database
+
+  train:
+    <<: *openpcdet
+    command:
+      - python3
+      - tools/train_labelcloud_pipeline.py
+      - --skip-convert
+      - --skip-info
+      - --out-dir
+      - ${OUT_DIR:-data/custom}
+      - --model
+      - ${MODEL:-pv_rcnn}
+      - --batch-size
+      - ${BATCH_SIZE:-auto}
+      - --workers
+      - ${WORKERS:-4}
+      - --num-gpus
+      - ${NUM_GPUS:-auto}
+      - --master-port
+      - ${MASTER_PORT:-18888}
+      - --epochs
+      - ${EPOCHS:-80}
+      - --aug-mode
+      - ${AUG_MODE:-full}
+      - --extra-tag
+      - ${EXTRA_TAG:-}
+      - --cfg-file
+      - ${CFG_FILE:-}
+      - --ckpt
+      - ${CKPT:-}
+      - --pretrained-model
+      - ${PRETRAINED_MODEL:-}
+
+  retrain:
+    <<: *openpcdet
+    command:
+      - python3
+      - tools/train_labelcloud_pipeline.py
+      - --skip-convert
+      - --skip-info
+      - --reset-output
+      - --out-dir
+      - ${OUT_DIR:-data/custom}
+      - --model
+      - ${MODEL:-pv_rcnn}
+      - --batch-size
+      - ${BATCH_SIZE:-auto}
+      - --workers
+      - ${WORKERS:-4}
+      - --num-gpus
+      - ${NUM_GPUS:-auto}
+      - --master-port
+      - ${MASTER_PORT:-18888}
+      - --epochs
+      - ${EPOCHS:-80}
+      - --aug-mode
+      - ${AUG_MODE:-full}
+      - --extra-tag
+      - ${EXTRA_TAG:-}
+      - --cfg-file
+      - ${CFG_FILE:-}
+      - --ckpt
+      - ""
+      - --pretrained-model
+      - ${PRETRAINED_MODEL:-}
+
+  infer:
+    <<: *openpcdet
+    command:
+      - python3
+      - tools/infer_labelcloud.py
+      - --model
+      - ${MODEL:-pv_rcnn}
+      - --cfg-file
+      - ${CFG_FILE:-}
+      - --ckpt
+      - ${CKPT:-auto}
+      - --output-dir
+      - ${PRED_OUT_DIR:-}
+      - --extra-tag
+      - ${EXTRA_TAG:-}
+      - --input-dir
+      - ${INPUT_DIR:-/workspace/infer}
+      - --score-thresh
+      - ${SCORE_THRESH:-0.3}
+
+  shell:
+    <<: *openpcdet
+    command: /bin/bash

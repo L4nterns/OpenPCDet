@@ -1,6 +1,9 @@
 import copy
+import hashlib
 import pickle
 import os
+import shutil
+from pathlib import Path
 
 import numpy as np
 
@@ -50,7 +53,10 @@ class CustomDataset(DatasetTemplate):
         label_file = self.root_path / 'labels' / ('%s.txt' % idx)
         assert label_file.exists()
         with open(label_file, 'r') as f:
-            lines = f.readlines()
+            lines = [line for line in f.readlines() if line.strip()]
+
+        if len(lines) == 0:
+            return np.zeros((0, 7), dtype=np.float32), np.array([])
 
         # [N, 8]: (x y z dx dy dz heading_angle category_id)
         gt_boxes = []
@@ -92,7 +98,7 @@ class CustomDataset(DatasetTemplate):
         sample_idx = info['point_cloud']['lidar_idx']
         points = self.get_lidar(sample_idx)
         input_dict = {
-            'frame_id': self.sample_id_list[index],
+            'frame_id': sample_idx,
             'points': points
         }
 
@@ -164,14 +170,51 @@ class CustomDataset(DatasetTemplate):
             infos = executor.map(process_single_scene, sample_id_list)
         return list(infos)
 
-    def create_groundtruth_database(self, info_path=None, used_classes=None, split='train'):
+    @staticmethod
+    def get_db_file_num_points(filepath, num_features):
+        if not filepath.exists():
+            return None
+        bytes_per_point = num_features * np.dtype(np.float32).itemsize
+        file_size = filepath.stat().st_size
+        if bytes_per_point <= 0 or file_size % bytes_per_point != 0:
+            return None
+        return file_size // bytes_per_point
+
+    @staticmethod
+    def resolve_gt_database_chunk_size(num_boxes, target_elements, min_chunk_size, max_chunk_size):
+        if min_chunk_size <= 0 or max_chunk_size <= 0:
+            raise ValueError('GT database chunk sizes must be positive.')
+        if min_chunk_size > max_chunk_size:
+            raise ValueError('GT database min chunk size cannot be larger than max chunk size.')
+        if target_elements <= 0:
+            return int(max_chunk_size)
+        if num_boxes <= 0:
+            return int(max_chunk_size)
+        chunk_size = max(1, int(target_elements) // max(1, int(num_boxes)))
+        return max(int(min_chunk_size), min(int(max_chunk_size), chunk_size))
+
+    def create_groundtruth_database(
+        self, info_path=None, used_classes=None, split='train',
+        target_elements=4000000, min_chunk_size=50000, max_chunk_size=500000,
+        max_points_per_object=0, resume=True, database_save_path=None, db_info_save_path=None
+    ):
         import torch
 
-        database_save_path = Path(self.root_path) / ('gt_database' if split == 'train' else ('gt_database_%s' % split))
-        db_info_save_path = Path(self.root_path) / ('custom_dbinfos_%s.pkl' % split)
+        database_save_path = Path(database_save_path) if database_save_path else (
+            Path(self.root_path) / ('gt_database' if split == 'train' else ('gt_database_%s' % split))
+        )
+        db_info_save_path = Path(db_info_save_path) if db_info_save_path else (
+            Path(self.root_path) / ('custom_dbinfos_%s.pkl' % split)
+        )
 
+        if not resume:
+            if database_save_path.exists():
+                shutil.rmtree(database_save_path)
+            if db_info_save_path.exists():
+                db_info_save_path.unlink()
         database_save_path.mkdir(parents=True, exist_ok=True)
-        all_db_infos = {}
+        db_classes = used_classes if used_classes is not None else self.class_names
+        all_db_infos = {name: [] for name in db_classes}
 
         with open(info_path, 'rb') as f:
             infos = pickle.load(f)
@@ -180,40 +223,93 @@ class CustomDataset(DatasetTemplate):
             print('gt_database sample: %d/%d' % (k + 1, len(infos)))
             info = infos[k]
             sample_idx = info['point_cloud']['lidar_idx']
-            points = self.get_lidar(sample_idx)
+            lidar_path = self.root_path / 'points' / ('%s.npy' % sample_idx)
+            label_path = self.root_path / 'labels' / ('%s.txt' % sample_idx)
+            source_mtime = max(lidar_path.stat().st_mtime_ns, label_path.stat().st_mtime_ns)
             annos = info['annos']
             names = annos['name']
             gt_boxes = annos['gt_boxes_lidar']
 
             num_obj = gt_boxes.shape[0]
-            point_indices = roiaware_pool3d_utils.points_in_boxes_cpu(
-                torch.from_numpy(points[:, 0:3]), torch.from_numpy(gt_boxes)
-            ).numpy()  # (nboxes, npoints)
-
+            points = None
+            num_features = info['point_cloud'].get('num_features')
+            if num_features is None:
+                points = self.get_lidar(sample_idx)
+                num_features = points.shape[1]
+            missing_indices = []
             for i in range(num_obj):
                 filename = '%s_%s_%d.bin' % (sample_idx, names[i], i)
                 filepath = database_save_path / filename
-                gt_points = points[point_indices[i] > 0]
+                existing_num_points = self.get_db_file_num_points(filepath, num_features)
+                if existing_num_points is not None and filepath.stat().st_mtime_ns >= source_mtime:
+                    if (used_classes is None) or names[i] in used_classes:
+                        db_path = str(filepath.relative_to(self.root_path))
+                        db_info = {'name': names[i], 'path': db_path, 'gt_idx': i,
+                                   'box3d_lidar': gt_boxes[i], 'num_points_in_gt': existing_num_points}
+                        all_db_infos[names[i]].append(db_info)
+                    continue
+                missing_indices.append(i)
+
+            if not missing_indices:
+                continue
+
+            if points is None:
+                points = self.get_lidar(sample_idx)
+            missing_boxes = gt_boxes[missing_indices]
+            gt_points_list = [[] for _ in missing_indices]
+            chunk_size = self.resolve_gt_database_chunk_size(
+                len(missing_indices), target_elements, min_chunk_size, max_chunk_size
+            )
+            print('  points=%d boxes=%d missing=%d chunk_size=%d' % (
+                points.shape[0], num_obj, len(missing_indices), chunk_size
+            ))
+
+            for start in range(0, points.shape[0], chunk_size):
+                end = min(start + chunk_size, points.shape[0])
+                points_chunk = points[start:end]
+                point_indices = roiaware_pool3d_utils.points_in_boxes_cpu(
+                    torch.from_numpy(points_chunk[:, 0:3]), torch.from_numpy(missing_boxes)
+                ).numpy()
+                for local_i in range(len(missing_indices)):
+                    obj_points = points_chunk[point_indices[local_i] > 0]
+                    if obj_points.shape[0] > 0:
+                        gt_points_list[local_i].append(obj_points)
+
+            for local_i, i in enumerate(missing_indices):
+                filename = '%s_%s_%d.bin' % (sample_idx, names[i], i)
+                filepath = database_save_path / filename
+                if gt_points_list[local_i]:
+                    gt_points = np.concatenate(gt_points_list[local_i], axis=0)
+                else:
+                    gt_points = np.zeros((0, points.shape[1]), dtype=points.dtype)
+
+                if max_points_per_object > 0 and gt_points.shape[0] > max_points_per_object:
+                    seed_bytes = hashlib.blake2b(f'{sample_idx}:{i}'.encode('utf-8'), digest_size=8).digest()
+                    seed = int.from_bytes(seed_bytes, byteorder='little') % (2 ** 32)
+                    rng = np.random.default_rng(seed)
+                    choice = rng.choice(gt_points.shape[0], max_points_per_object, replace=False)
+                    gt_points = gt_points[choice]
 
                 gt_points[:, :3] -= gt_boxes[i, :3]
-                with open(filepath, 'w') as f:
+                tmp_filepath = filepath.with_suffix(filepath.suffix + '.tmp')
+                with open(tmp_filepath, 'wb') as f:
                     gt_points.tofile(f)
+                os.replace(tmp_filepath, filepath)
 
                 if (used_classes is None) or names[i] in used_classes:
                     db_path = str(filepath.relative_to(self.root_path))  # gt_database/xxxxx.bin
                     db_info = {'name': names[i], 'path': db_path, 'gt_idx': i,
                                'box3d_lidar': gt_boxes[i], 'num_points_in_gt': gt_points.shape[0]}
-                    if names[i] in all_db_infos:
-                        all_db_infos[names[i]].append(db_info)
-                    else:
-                        all_db_infos[names[i]] = [db_info]
+                    all_db_infos[names[i]].append(db_info)
 
         # Output the num of all classes in database
         for k, v in all_db_infos.items():
             print('Database %s: %d' % (k, len(v)))
 
-        with open(db_info_save_path, 'wb') as f:
+        tmp_db_info_save_path = db_info_save_path.with_suffix(db_info_save_path.suffix + '.tmp')
+        with open(tmp_db_info_save_path, 'wb') as f:
             pickle.dump(all_db_infos, f)
+        os.replace(tmp_db_info_save_path, db_info_save_path)
 
     @staticmethod
     def create_label_file_with_name_and_box(class_names, gt_names, gt_boxes, save_label_path):
@@ -230,7 +326,14 @@ class CustomDataset(DatasetTemplate):
                 f.write(line)
 
 
-def create_custom_infos(dataset_cfg, class_names, data_path, save_path, workers=4):
+def create_custom_infos(
+    dataset_cfg, class_names, data_path, save_path, workers=4,
+    target_elements=4000000, min_chunk_size=50000, max_chunk_size=500000,
+    max_points_per_object=0, resume_gt_database=True
+):
+    data_path = Path(data_path)
+    save_path = Path(save_path)
+    save_path.mkdir(parents=True, exist_ok=True)
     dataset = CustomDataset(
         dataset_cfg=dataset_cfg, class_names=class_names, root_path=data_path,
         training=False, logger=common_utils.create_logger()
@@ -261,7 +364,16 @@ def create_custom_infos(dataset_cfg, class_names, data_path, save_path, workers=
 
     print('------------------------Start create groundtruth database for data augmentation------------------------')
     dataset.set_split(train_split)
-    dataset.create_groundtruth_database(train_filename, split=train_split)
+    dataset.create_groundtruth_database(
+        train_filename, split=train_split,
+        target_elements=target_elements,
+        min_chunk_size=min_chunk_size,
+        max_chunk_size=max_chunk_size,
+        max_points_per_object=max_points_per_object,
+        resume=resume_gt_database,
+        database_save_path=save_path / 'gt_database',
+        db_info_save_path=save_path / ('custom_dbinfos_%s.pkl' % train_split),
+    )
     print('------------------------Data preparation done------------------------')
 
 
@@ -269,15 +381,41 @@ if __name__ == '__main__':
     import sys
 
     if sys.argv.__len__() > 1 and sys.argv[1] == 'create_custom_infos':
+        import argparse
         import yaml
-        from pathlib import Path
         from easydict import EasyDict
 
-        dataset_cfg = EasyDict(yaml.safe_load(open(sys.argv[2])))
+        parser = argparse.ArgumentParser(description='Create OpenPCDet custom dataset infos.')
+        parser.add_argument('command', choices=['create_custom_infos'])
+        parser.add_argument('dataset_cfg')
+        parser.add_argument('--data-path', default='data/custom')
+        parser.add_argument('--save-path', default=None)
+        parser.add_argument('--workers', type=int, default=4)
+        parser.add_argument('--gt-database-target-elements', type=int, default=4000000)
+        parser.add_argument('--gt-database-min-chunk-size', type=int, default=50000)
+        parser.add_argument('--gt-database-max-chunk-size', type=int, default=500000)
+        parser.add_argument('--gt-database-max-points', type=int, default=0)
+        parser.add_argument('--rebuild-gt-database', action='store_true')
+        args = parser.parse_args()
+
+        dataset_cfg = EasyDict(yaml.safe_load(open(args.dataset_cfg)))
         ROOT_DIR = (Path(__file__).resolve().parent / '../../../').resolve()
+        class_names = dataset_cfg.get('CLASS_NAMES', ['Vehicle', 'Pedestrian', 'Cyclist'])
+        data_path = Path(args.data_path)
+        save_path = Path(args.save_path) if args.save_path else data_path
+        if not data_path.is_absolute():
+            data_path = ROOT_DIR / data_path
+        if not save_path.is_absolute():
+            save_path = ROOT_DIR / save_path
         create_custom_infos(
             dataset_cfg=dataset_cfg,
-            class_names=['Vehicle', 'Pedestrian', 'Cyclist'],
-            data_path=ROOT_DIR / 'data' / 'custom',
-            save_path=ROOT_DIR / 'data' / 'custom',
+            class_names=class_names,
+            data_path=data_path,
+            save_path=save_path,
+            workers=args.workers,
+            target_elements=args.gt_database_target_elements,
+            min_chunk_size=args.gt_database_min_chunk_size,
+            max_chunk_size=args.gt_database_max_chunk_size,
+            max_points_per_object=args.gt_database_max_points,
+            resume_gt_database=not args.rebuild_gt_database,
         )

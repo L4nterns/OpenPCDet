@@ -12,8 +12,14 @@ from .waymo.waymo_dataset import WaymoDataset
 from .pandaset.pandaset_dataset import PandasetDataset
 from .lyft.lyft_dataset import LyftDataset
 from .once.once_dataset import ONCEDataset
-from .argo2.argo2_dataset import Argo2Dataset
 from .custom.custom_dataset import CustomDataset
+
+try:
+    from .argo2.argo2_dataset import Argo2Dataset
+except ImportError as err:
+    if err.name not in ('av2', 'av2.utils', 'av2.utils.io'):
+        raise
+    Argo2Dataset = None
 
 __all__ = {
     'DatasetTemplate': DatasetTemplate,
@@ -24,8 +30,9 @@ __all__ = {
     'LyftDataset': LyftDataset,
     'ONCEDataset': ONCEDataset,
     'CustomDataset': CustomDataset,
-    'Argo2Dataset': Argo2Dataset
 }
+if Argo2Dataset is not None:
+    __all__['Argo2Dataset'] = Argo2Dataset
 
 
 class DistributedSampler(_DistributedSampler):

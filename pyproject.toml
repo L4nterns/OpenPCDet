@@ -1,0 +1,12 @@
+[project]
+name = "openpcdet-labelcloud-host-tools"
+version = "0.1.0"
+description = "Host-side utilities for inspecting labelCloud inference outputs."
+requires-python = ">=3.10,<3.12"
+dependencies = [
+    "numpy>=1.23",
+    "open3d>=0.18",
+]
+
+[tool.uv]
+package = false
